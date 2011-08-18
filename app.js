@@ -1,252 +1,309 @@
-var database = require('./config').database;
-var secret_key = "test";
-var sys = require('sys');
-var mysql= require('mysql');
-var crypto = require ('crypto'); //node.js needs to be compiled with openssl support
-var client = new mysql.Client();
+//require.paths.push('/home/ubuntu/.node_libraries');
+VCAP_APP_PORT = Number(process.env.VCAP_APP_PORT) || 80;
+//VCAP_APP_PORT = '80';
+require.paths.push('./node_modules');
+var sys = require('sys'),
+    exec = require('child_process').exec,
+    express = require('express'), 
+    server = express.createServer(express.logger()),
+    appops = require('./appops.js'),
+    io = require('socket.io');
 
-client.host = database.host;
-client.user = database.username;
-client.port = database.port;
-client.password = database.password;
-client.database = database.name;
+server.configure(function(){
+	server.use(server.router);
+	server.use(express.staticProvider(__dirname+'/public'));
+});
 
-client.connect();
+/* errors! */
+	function NotFound(msg){
+		this.name = 'NotFound';
+		Error.call(this, msg);
+		Error.captureStackTrace(this, arguments.callee);
+	}
 
-function esafe(cb){
-    var callback = cb;
-    return function(err, res, f){
-        if(err) throw err;
-        callback(res);
-    };
-}
+	sys.inherits(NotFound, Error);
 
-exports.getSketchFromHash = function(hash, callback) {
-	client.query('SELECT * FROM sketch WHERE hash = ?', [hash], function (err, results, fields){
-		if(err) throw err;
-		
-		if(results.length == 1) {
-			callback(results[0]);
+	server.get('/404', function(req, res){
+		throw new NotFound;
+	});
+
+	server.get('/500', function(req, res){
+		throw new Error('Server error!');
+	});
+
+	server.error(function (err, req, res, next){
+		if (err instanceof NotFound){
+			res.redirect("/view/404")
+		}else {
+			next(err);
 		}
 	});
+
+
+/* starts the server */
+port = parseInt(VCAP_APP_PORT);
+console.log("Trying to listen on port", port);
+server.listen(port);
+console.log("Listening on port", port);
+appops.setupdb();
+console.log("Loaded db schema", port);
+
+/* websocket stuff */
+var sketches = {}, clients = {};
+
+function eachInSketch(sketchBaseId, callback){
+    if(sketches[sketchBaseId] == undefined)
+        sketches[sketchBaseId] = [];
+    for(var x in sketches[sketchBaseId]){
+        callback(sketches[sketchBaseId][x]);
+    }
 }
 
-exports.sha1 = function(x){
-    return crypto.createHash('sha1').update(x+secret_key).digest('hex');
-};
-
-exports.getSketch = function (id, runFunction){
-    client.query("select * from sketch where id = ?", [id], function(err, results, fields){
-		if(err) throw err;
-	
-		if (results.length ===1) {
-			runFunction(results);	
-		}
-    });
-};
-
-
-exports.addSketch = function (runFunction){
-    var sql = "INSERT INTO sketch (hash, created_at, modified_at) values ('', NULL, NULL)";
-	client.query (sql, function(err, results, fields){
-		if(err) throw err;
-			
-		var insertId = results.insertId;
-		
-		sql = "UPDATE sketch SET hash=?, parent_id=?, root_id=? WHERE id=?";
-		var sha1hash = exports.sha1(insertId);
-		client.query(sql, [sha1hash, sha1hash, sha1hash, insertId], function(err, results, fields){
-			if(err) throw err;				
-			runFunction(sha1hash);
-		});
-    });
-}
-
-
-exports.addUser = function(user,sketch,runFunction) {
-	client.query("INSERT INTO user(name,email) values (?, ?)", [user.name, user.email], function selectCb(err, results, fields) {
-		if (err){
-			throw err;
-		}
-		var userId = results.insertId;
-			client.query("INSERT INTO user_to_sketch (user_id, sketch_id) values (?, ?)", [userId, sketch.id], function (err,results, fields){
-				if (err){
-					throw err;
-				}
-				var userObj = {id: userId, name: user.name, email: user.email};
-				runFunction(userObj);
-			});
-		
-	});
-}
-
-
-exports.leaveSketch = function(user_id, sketch_id, runFunction) {
-    sql = "UPDATE user_to_sketch SET is_active = 0 WHERE user_id = ? AND sketch_id = ?";
-	client.query (sql, [user_id, sketch_id], function (err, results, fields) {
-		if(err)
-			throw err;
-		runFunction(user);
-	});
-}
-
-
-exports.addSegment = function(sketch, segment, runFunction) {
-	console.log(segment);
-	client.query ("INSERT INTO segment (color, points) values(?,?)", [segment.color, JSON.stringify(segment.points)], 
-		function(err, result, fields){
-			if (err) throw err;
-			var segmentId = result.insertId;
-			exports.getSketchFromHash(sketch.revision_id, function (sketch){
-			    var sql = "INSERT INTO sketch_to_segment (sketch_id, segment_id) values(?, ?)";
-				client.query(sql, [sketch.id, segmentId], function (err, result, fields){
-					if(err) throw err;
-					runFunction({id: segmentId, color: segment.color, points: segment.points});
-				});
-			});
-		});
-}
-
-exports.eachLeaf = function(rootId, cb){
-    client.query("SELECT * FROM sketch WHERE root_id = ?", [rootId], function(err, res, f){
-        if(err) throw err;
-        for(var x in res){
-            cb(res[x]);
+function removeFromSketch(sessionId){
+    if(clients[sessionId] != undefined){
+        var arr = sketches[clients[sessionId]] || [];
+        delete clients[sessionId];
+        
+        for(var x in arr){
+            if(arr[x].sessionId == sessionId){
+                return arr.splice(x, 1);
+            }
         }
-    });
+    }
 }
 
-exports.getPointsInSegment = function(segment, runFunction) {
-	client.query("SELECT * FROM segment WHERE id = ?", [segment.segment_id], 
-		function(err, results, fields) {
-			if(err) throw err;
+//Setup Socket.IO
+var io = io.listen(server, { transports: ['xhr-polling'], 
+                             transportOptions : {'xhr-polling' : { duration : 10000 } }  }
+                  );
+io.on('connection', function(client){    
 
-			if (results.length === 1) {
-				runFunction(results[0]);
-			}
-		});
+	client.on('message', function(message){
+	    message = JSON.parse(message);
+	    
+	    var isNew = clients[client.sessionId] == undefined;
+	    
+	    if(isNew){
+	        appops.eachLeaf(message.sketch_base_id, function(leaf){
+	            appops.eachSegmentId(leaf, function(sid){
+	                appops.getPointsInSegment({segment_id:sid}, function(seg){
+	                    client.send(JSON.stringify({
+	                        segment: seg,
+	                        action: 'add_segment',
+	                        sketch_revision_id: leaf.hash
+	                    }));
+                    });
+	            });
+	        });
+	    }
 
-}
-
-exports.getFullSketch = function(id, cb){
-    client.query('SELECT * FROM segment JOIN sketch_to_segment ON segment.id = sketch_to_segment.segment_id WHERE sketch_to_segment.sketch_id = ?',
-        [id], function(e,res,f){
-            cb(res);
-        });
-}
-
-exports.eachSegmentId = function(sketch, callback){
-    sql = "SELECT segment_id FROM sketch_to_segment WHERE sketch_id = ?";
-    client.query(sql, [sketch.id], function(err, results, fields){
-	    if (err) throw err;
+		switch(message['action']){
+		    case "save_sketch":
+		        appops.saveImage(message.payload, function(k){
+		            client.send(JSON.stringify({action: "share_key", key: k}));
+		        });
+		        break;
+		        
+			case "user_added":
+			    if(sketches[message.sketch_base_id] == undefined)
+			        sketches[message.sketch_base_id] = [];
+			        
+			    var c = sketches[message.sketch_base_id];
+			        
+			    client.username = message.name;
+			    
+			    removeFromSketch(client.sessionId);
+			    clients[client.sessionId] = message.sketch_base_id;
 		
-		for(x in results){
-		    callback(results[x].segment_id);
-		}
-	});
-}
+			    c.push(client);	    
+			    			    			    
+			    for(x in c){
+			        c[x].send(JSON.stringify({action: "add_user",
+			                                  name  : client.username,
+			                                  id    : appops.sha1(client.sessionId),
+			                                  me    : c[x].sessionId == client.sessionId }));
+			        
+			        if(isNew && x != c.length-1){
+			            client.send(JSON.stringify({
+			                action  : "add_user",
+			                name    : c[x].username,
+			                id      : appops.sha1(c[x].sessionId)
+			            }));
+			        }
+			    }
 
+				break;
+			case "segment_added":
+				var segment = message.segment;
+				var sketch = {base_id: message.sketch_base_id, revision_id: message.sketch_revision_id};
+				console.log ("segment added ");
+				if (segment.id) {
+					
+					appops.undeleteSegment(sketch.revision_id, segment, function(segmentObj) {
+						c = sketches[message.sketch_base_id];
+						for (x  in c ){
+							c[x].send(JSON.stringify({
+								action: "add_segment", 
+								segment: segmentObj,
+								sketch_revision_id: message.sketch_revision_id
+							}));
+						}
 
-exports.getSegmentIds = function(sketch, runFunction){
-	client.query("SELECT segment_id FROM sketch_to_segment WHERE sketch_id = ?", [sketch.id],
-		function(err, results, fields){
-			if (err){
-				throw err;
-			}
-			runFunction(results);
-		}
-	);
-}
-
-exports.createVariation = function(rev_id, callback){
-	exports.getSketchFromHash(rev_id,function(sketch){
-		var base_id = sketch.id;
-		exports.addSketch(function(hsh){
-			exports.eachSegmentId({id:base_id}, function(sid){
-				var sql = "INSERT INTO sketch_to_segment(sketch_id, segment_id) VALUES ((select id from sketch where hash=?), ?)";
-				client.query(sql, [hsh, sid], function(e,r,f){});
-			});
-			// update leaf to correct root/parent ids
-			sql = "UPDATE sketch SET parent_id = ?, root_id = ? WHERE hash = ?";
-			client.query(sql,[sketch.hash,sketch.root_id,hsh], function(err,results,fields) {
-				if (err)
-					throw err;
-				exports.getSketchFromHash(hsh,function(leaf){
-					leaf.hash = hsh;
-					callback(leaf);
-				});
-			});
-		});
-	});
-}
-
-exports.mergeVariation = function(bottom_rev_id, top_rev_id, callback){
-	exports.getSketchFromHash(bottom_rev_id,function(sketch_bot){
-		exports.getSketchFromHash(top_rev_id,function(sketch_top){
-			var base_bot_id = sketch_bot.id;
-			var base_top_id = sketch_top.id;
-			exports.addSketch(function(hsh){
-				segments = [];
-				exports.eachSegmentId({id:base_bot_id}, function(sid){
-					var sql = "INSERT INTO sketch_to_segment(sketch_id, segment_id) VALUES ((select id from sketch where hash=?), ?)";
-					client.query(sql, [hsh, sid], function(e,r,f){});
-				});
-				exports.eachSegmentId({id:base_top_id}, function(sid){
-					var sql = "SELECT * FROM sketch_to_segment WHERE segment_id = ? AND sketch_id = (select id from sketch where hash=?)";
-					client.query(sql, [sid,hsh], function(e,r,f){
-						if (r.length < 1) {
-							var sql2 = "INSERT INTO sketch_to_segment(sketch_id, segment_id) VALUES ((select id from sketch where hash=?), ?)";
-							client.query(sql2, [hsh, sid], function(e,r,f){});
+					});
+				}else {
+					appops.addSegment(sketch, segment, function(segmentObj) {
+						c = sketches[message.sketch_base_id];
+						for (x  in c ){
+							c[x].send(JSON.stringify({
+								action: "add_segment", 
+								segment: segmentObj,
+								sketch_revision_id: message.sketch_revision_id
+							}));
 						}
 					});
+				}
+				break;
+			case "segment_deleted":
+			    appops.deleteSegment(message.sketch_revision_id, message.segment_id);
+			    eachInSketch(message.sketch_base_id, function(cli){
+			        cli.send(JSON.stringify({action:'delete_segment',
+			                                 sketch_revision_id:message.sketch_revision_id,
+			                                 sketch_base_id:message.sketch_base_id,
+			                                 segment_id:message.segment_id}));
+			    });
+			    break;
+			case "get_segment":
+				var seg = {segment_id: message.segment_id};
+				appops.getPointsInSegment(seg, function(segmentObj){
+					client.send(JSON.stringify({action: "add_segment", segment : segmentObj}));
 				});
-				// update leaf to correct root/parent ids
-				sql = "UPDATE sketch SET parent_id = ?, root_id = ? WHERE hash = ?";
-				client.query(sql,[sketch_top.hash,sketch_top.root_id,hsh], function(err,results,fields) {
-					if (err)
-						throw err;
-					exports.getSketchFromHash(hsh,function(leaf){
-						leaf.hash = hsh;
-						callback(leaf);
+				break;
+			case "variation_added":
+			    appops.createVariation(message.sketch_parent_id, function(leaf){
+			        eachInSketch(clients[client.sessionId], function(cli){
+			            cli.send(JSON.stringify({
+			                action: 'add_variation',
+			                sketch_parent_id: message.sketch_parent_id,
+			                sketch_base_id: message.sketch_base_id,
+			                real_id: leaf.id,
+			                sketch_revision_id: leaf.hash
+			            }));
+			        });
+			        appops.eachSegmentId(leaf, function(sid){
+    	                appops.getPointsInSegment({segment_id:sid}, function(seg){
+    	                    eachInSketch(clients[client.sessionId], function(cli){
+    	                        cli.send(JSON.stringify({
+        	                        segment: seg,
+        	                        action: 'add_segment',
+        	                        sketch_revision_id: leaf.hash,
+        	                        sketch_real_id: leaf.id
+        	                    }));
+    	                    });
+                        });
+    	            });
+			    });
+			    break;
+			case "variation_merged":
+			    appops.mergeVariation(message.bottom_revision_id,message.top_revision_id, function(leaf){
+			        eachInSketch(clients[client.sessionId], function(cli){
+			            cli.send(JSON.stringify({
+			                action: 'add_variation',
+			                sketch_parent_id: message.sketch_parent_id,
+			                sketch_base_id: message.sketch_base_id,
+			                real_id: leaf.id,
+			                sketch_revision_id: leaf.hash
+			            }));
+			        });
+			        appops.eachSegmentId(leaf, function(sid){
+    	                appops.getPointsInSegment({segment_id:sid}, function(seg){
+    	                    eachInSketch(clients[client.sessionId], function(cli){
+    	                        cli.send(JSON.stringify({
+        	                        segment: seg,
+        	                        action: 'add_segment',
+        	                        sketch_revision_id: leaf.hash,
+        	                        sketch_real_id: leaf.id
+        	                    }));
+    	                    });
+                        });
+    	            });
+			    });
+			    break;
+			case "sketch_replay_requested":
+				console.log("\n\nreplaying: " + message.sketch_revision_id);
+				appops.getSketchFromHash(message.sketch_revision_id,function(sketch) {
+					appops.getFullSketch(sketch.id, function(segmentObj){
+						console.log("inner replay: ");
+						console.log(segmentObj);
+						segmentObj.forEach(function(segment) {
+							client.send(JSON.stringify({
+								action: "add_segment", 
+								segment: segment,
+								sketch_revision_id: message.sketch_revision_id
+							}));
+						});
 					});
 				});
-			});
-		});
+				break;
+			default:
+				console.log(message);
+				
+		}
 	});
-}
-
-exports.deleteSegment = function(sketch_revision_id, segment_id){
-	//console.log(sketch_revision_id);
-	//console.log(segment_id);
-	exports.getSketchFromHash(sketch_revision_id, function(sketch) {
-		client.query("DELETE FROM sketch_to_segment where sketch_id=? AND segment_id=?", [ sketch.id, segment_id]);
+	
+	client.on('disconnect', function(){
+	    eachInSketch(clients[client.sessionId], function(cli){
+	        cli.send(JSON.stringify({action:"sign_off_user", id:appops.sha1(client.sessionId)}));
+	    });
+	    removeFromSketch(client.sessionId);
 	});
-    //client.query("DELETE FROM sketch_to_segment WHERE segment_id=? AND sketch_id=?",
-    //            [segment_id, sketch_revision_id]);
-}
+});
 
 
-exports.undeleteSegment = function (sketch_revision_id, segment, callback) {
-		console.log(sketch_revision_id);
-		console.log(segment);
-		exports.getSketchFromHash(sketch_revision_id, function(sketch) {
-			console.log(sketch);
-			client.query("INSERT INTO sketch_to_segment(sketch_id, segment_id) values(?,?) ", [sketch.id, segment.id], function (err, result, fields) {
-				if (err) throw err;
-				callback(segment)
-			});
+// Routes //
+
+server.get('/setup', function(req,res) {
+	appops.setupdb();
+});
+
+server.get('/', function(req,res) {
+	res.sendfile(__dirname+'/public/index.html');
+});
+
+server.get('/sketch/:hash?', function(req,res){
+	if(req.params.hash){
+		    if (req.params.hash != "public" && req.params.hash.length != 40){
+				res.redirect("/view/404");
+			}else {
+
+				res.sendfile(__dirname+'/public/drawing.html');
+			}
+	}else{
+		appops.addSketch(function(hsh) {
+			res.redirect('/sketch/'+hsh, 302);
 		});
-}
+	}
+});
 
-exports.saveImage = function(data, callback){
-    client.query("INSERT INTO saved_sketch(`key`, data) VALUES(?, ?)", [exports.sha1(data), data], function(e,r,f){
-        callback(exports.sha1(data));
-    });
-}
+server.get('/view/:hash?', function (req, res) {
+	if(req.params.hash){
+		if (req.params.hash != "404" && req.params.hash.length != 40){
+				res.redirect("/view/404");
+		}
 
-exports.getImage = function(key, callback){
-    client.query("SELECT data FROM saved_sketch WHERE `key`=?", [key], function(e,r,f){
-        callback(r[0].data); 
+			res.sendfile(__dirname+'/public/view.html');
+	} else {
+		res.redirect('/sketch',302);
+	}
+});
+
+server.get("/rendered/:key", function(req, res){
+    appops.getImage(req.params.key, function(data){
+        res.writeHead(200, {'Content-Type': 'text/plain'});
+        res.end(data);
     });
-}
+});
+
+/*server.get("/:x", function(req, res){
+    res.redirect('/404');
+});*/
 
